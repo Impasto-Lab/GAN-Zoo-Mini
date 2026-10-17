@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+# MLP: noise z [B, in_dim] -> flattened image [B, out_dim], values in [-1, 1]
 class Generator(nn.Module):
     def __init__(self, in_dim, out_dim):
         super().__init__()
@@ -16,13 +17,14 @@ class Generator(nn.Module):
         x = self.tanh(self.fc3(x))
         return x
 
+# MLP: flattened image [B, in_dim] -> probability that the image is real [B, 1]
 class Discriminator(nn.Module):
     def __init__(self, in_dim):
         super().__init__()
         self.fc1 = nn.Linear(in_dim, 512)
         self.fc2 = nn.Linear(512, 256)
         self.fc3 = nn.Linear(256, 1)
-        self.drop = nn.Dropout(0.2)
+        self.drop = nn.Dropout(0.2)  # The paper also uses dropout in D
         self.act = nn.LeakyReLU(0.2)
         self.sig = nn.Sigmoid()
 
@@ -33,6 +35,7 @@ class Discriminator(nn.Module):
         return self.sig(x)
 
 if __name__ == '__main__':
+    # Shape check with small sizes
     device = 'cuda'
     noise = torch.randn(1, 16).to(device)
 
