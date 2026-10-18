@@ -1,66 +1,78 @@
+import argparse
 import os
 import time
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import ConcatDataset
-from torchvision import datasets, transforms
+from torchvision import datasets
 from torchvision.utils import save_image
 
-from models.gan import Generator, Discriminator
+from models import dcgan, gan
+
+# Every model file defines Generator and Discriminator, so any module works here
+MODELS = {'gan': gan, 'dcgan': dcgan}
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-m', '--model', type=str, default='gan', choices=MODELS.keys())
+    parser.add_argument('-l', '--real-label', type=float, default=1.0,
+                        help='Target label of real images for D. 0.9 enables one-sided label smoothing.')
+    args = parser.parse_args()
+
+    model = MODELS[args.model]
+    out_dir = f'./outputs/{args.model}'
+    if args.real_label != 1.0:
+        out_dir += f'_real{args.real_label}'  # Do not overwrite the default run
+
     device = 'cuda'
     batch_size = 256
 
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))  # [0, 1] -> [-1, 1] to match tanh output
-    ])
+    # GAN is unsupervised: use train + test (70k images)
+    trainset = datasets.MNIST(root='./data', train=True, download=True)
+    testset = datasets.MNIST(root='./data', train=False, download=True)
 
-    # GAN is unsupervised, so merge train and test sets to get 70k images
-    trainset = datasets.MNIST(root='./data', train=True, download=True, transform=transform)
-    testset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
-    dataset = ConcatDataset([trainset, testset])
+    # Load all images to the GPU once (220 MB), much faster than a per-image DataLoader
+    images = torch.cat([trainset.data, testset.data]).to(device)  # uint8 [70000, 28, 28]
+    images = (images.float() / 255 - 0.5) / 0.5  # [0, 255] -> [-1, 1], same range as tanh
+    images = images.unsqueeze(1)  # [70000, 1, 28, 28]
 
-    # Load the whole dataset to the GPU once (MNIST is only 220 MB).
-    # This is faster than a DataLoader, which transforms each image on the CPU in every epoch.
-    data = torch.stack([img for img, _ in dataset]).flatten(1).to(device)  # [70000, 784]
+    # Labels: not used by GAN and DCGAN, needed by cGAN
+    labels = torch.cat([trainset.targets, testset.targets]).to(device)  # [70000]
 
     # Models, optimizers and loss
-    generator = Generator(128, 784).to(device)
-    discriminator = Discriminator(784).to(device)
+    generator = model.Generator(128, (1, 28, 28)).to(device)
+    discriminator = model.Discriminator((1, 28, 28)).to(device)
 
     opt_G = optim.Adam(generator.parameters(), lr=2e-4, betas=(0.5, 0.999))
     opt_D = optim.Adam(discriminator.parameters(), lr=2e-4, betas=(0.5, 0.999))
     criterion = nn.BCELoss()
 
-    # Same noise every time, so the saved images show how G changes over training
+    # Fixed noise, so the saved images show how G changes
     fixed_noise = torch.randn(64, 128).to(device)
-    os.makedirs('./outputs', exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
 
-    num_batches = len(range(0, len(data), batch_size))
+    num_batches = len(range(0, len(images), batch_size))
 
     for epoch in range(100):
         start = time.time()
 
-        # Sums over the epoch, kept on the GPU (calling .item() at every step makes the GPU wait)
+        # Epoch sums stay on the GPU (.item() at every step makes the CPU wait for the GPU)
         sum_loss_D = sum_loss_G = sum_D_real = sum_D_fake = 0.0
 
-        perm = torch.randperm(len(data), device=device)  # New random order every epoch
-        for k in range(0, len(data), batch_size):
-            # One batch of real images and the same number of fake images
-            real = data[perm[k:k + batch_size]]
+        perm = torch.randperm(len(images), device=device)  # Shuffle
+        for k in range(0, len(images), batch_size):
+            idx = perm[k:k + batch_size]
+            real, real_labels = images[idx], labels[idx]
             noise = torch.randn(real.shape[0], 128).to(device)
             fake = generator(noise)
 
-            # Update D: label real as 1 and fake as 0.
-            # detach() cuts the graph at fake, so loss_D does not flow back into G.
+            # Update D: real -> real_label, fake -> 0. detach() keeps loss_D out of G.
+            # real_label < 1 is one-sided label smoothing (Salimans et al., 2016).
             pred_real = discriminator(real)
             pred_fake = discriminator(fake.detach())
-            loss_real = criterion(pred_real, torch.ones_like(pred_real))
+            loss_real = criterion(pred_real, torch.full_like(pred_real, args.real_label))
             loss_fake = criterion(pred_fake, torch.zeros_like(pred_fake))
 
             loss_D = loss_real + loss_fake
@@ -68,10 +80,8 @@ def main():
             loss_D.backward()
             opt_D.step()
 
-            # Update G: label fake as 1, i.e. minimize -log D(G(z)) instead of log(1 - D(G(z))).
-            # The paper suggests this because log(1 - D(G(z))) gives almost no gradient early on.
-            # fake is reused: G has not changed since it was made, so its graph is still valid.
-            # loss_G.backward() also adds grads to D, but opt_D.zero_grad() clears them next step.
+            # Update G: fake -> 1, i.e. minimize -log D(G(z)) (non-saturating loss).
+            # Reuse fake: G is unchanged. Grads this adds to D are cleared next step.
             pred_fake = discriminator(fake)
             loss_G = criterion(pred_fake, torch.ones_like(pred_fake))
             opt_G.zero_grad()
@@ -83,8 +93,7 @@ def main():
             sum_D_real += pred_real.detach().mean()
             sum_D_fake += pred_fake.detach().mean()
 
-        # D(x): mean score of D on real images. D(G(z)): mean score of D on fake images.
-        # Both near 0.5 means G and D are balanced. D(x) -> 1 and D(G(z)) -> 0 means D wins.
+        # D(x), D(G(z)): mean D score on real and fake. Both near 0.5: balanced. 1 and 0: D wins.
         print(f'epoch {epoch+1:3d} | '
               f'loss_D {sum_loss_D.item() / num_batches:.3f} | '
               f'loss_G {sum_loss_G.item() / num_batches:.3f} | '
@@ -92,15 +101,15 @@ def main():
               f'D(G(z)) {sum_D_fake.item() / num_batches:.3f} | '
               f'{time.time() - start:.1f}s')
 
-        # Save a sample grid every 5 epochs
+        # Save samples every 5 epochs
         if (epoch + 1) % 5 == 0:
             with torch.no_grad():
-                samples = generator(fixed_noise).view(-1, 1, 28, 28)
-            save_image((samples + 1) / 2, f'./outputs/epoch_{epoch+1:03d}.png', nrow=8)  # [-1, 1] -> [0, 1]
+                samples = generator(fixed_noise)
+            save_image((samples + 1) / 2, f'{out_dir}/epoch_{epoch+1:03d}.png', nrow=8)  # [-1, 1] -> [0, 1]
 
-    # Save the final weights
-    torch.save(generator.state_dict(), f'./outputs/generator.pth')
-    torch.save(discriminator.state_dict(), f'./outputs/discriminator.pth')
+    # Save final weights
+    torch.save(generator.state_dict(), f'{out_dir}/generator.pth')
+    torch.save(discriminator.state_dict(), f'{out_dir}/discriminator.pth')
 
 if __name__ == '__main__':
     main()
