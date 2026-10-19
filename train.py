@@ -8,10 +8,10 @@ import torch.optim as optim
 from torchvision import datasets
 from torchvision.utils import save_image
 
-from models import dcgan, gan
+from models import gan, dcgan, cgan
 
 # Every model file defines Generator and Discriminator, so any module works here
-MODELS = {'gan': gan, 'dcgan': dcgan}
+MODELS = {'gan': gan, 'dcgan': dcgan, 'cgan': cgan}
 
 
 def main():
@@ -24,7 +24,7 @@ def main():
     model = MODELS[args.model]
     out_dir = f'./outputs/{args.model}'
     if args.real_label != 1.0:
-        out_dir += f'_real{args.real_label}'  # Do not overwrite the default run
+        out_dir += f'_real{args.real_label}'
 
     device = 'cuda'
     batch_size = 256
@@ -49,8 +49,13 @@ def main():
     opt_D = optim.Adam(discriminator.parameters(), lr=2e-4, betas=(0.5, 0.999))
     criterion = nn.BCELoss()
 
-    # Fixed noise, so the saved images show how G changes
-    fixed_noise = torch.randn(64, 128).to(device)
+    # Fixed noise (and labels), so the saved images show how G changes
+    if args.model != 'cgan':
+        fixed_noise = torch.randn(64, 128, device=device)  # 8 x 8 grid
+    else:
+        # 10 x 8 grid: row i is digit i, each column shares one noise vector (same style)
+        fixed_noise = torch.randn(8, 128, device=device).repeat(10, 1)  # [80, 128]
+        fixed_labels = torch.arange(10, device=device).repeat_interleave(8)  # [80]: 0 x8, ..., 9 x8
     os.makedirs(out_dir, exist_ok=True)
 
     num_batches = len(range(0, len(images), batch_size))
@@ -66,12 +71,19 @@ def main():
             idx = perm[k:k + batch_size]
             real, real_labels = images[idx], labels[idx]
             noise = torch.randn(real.shape[0], 128).to(device)
-            fake = generator(noise)
+            if args.model != 'cgan':
+                fake = generator(noise)
+            else:
+                fake = generator(noise, real_labels)
 
             # Update D: real -> real_label, fake -> 0. detach() keeps loss_D out of G.
             # real_label < 1 is one-sided label smoothing (Salimans et al., 2016).
-            pred_real = discriminator(real)
-            pred_fake = discriminator(fake.detach())
+            if args.model != 'cgan':
+                pred_real = discriminator(real)
+                pred_fake = discriminator(fake.detach())
+            else:
+                pred_real = discriminator(real, real_labels)
+                pred_fake = discriminator(fake.detach(), real_labels)
             loss_real = criterion(pred_real, torch.full_like(pred_real, args.real_label))
             loss_fake = criterion(pred_fake, torch.zeros_like(pred_fake))
 
@@ -82,7 +94,10 @@ def main():
 
             # Update G: fake -> 1, i.e. minimize -log D(G(z)) (non-saturating loss).
             # Reuse fake: G is unchanged. Grads this adds to D are cleared next step.
-            pred_fake = discriminator(fake)
+            if args.model != 'cgan':
+                pred_fake = discriminator(fake)
+            else:
+                pred_fake = discriminator(fake, real_labels)
             loss_G = criterion(pred_fake, torch.ones_like(pred_fake))
             opt_G.zero_grad()
             loss_G.backward()
@@ -104,7 +119,10 @@ def main():
         # Save samples every 5 epochs
         if (epoch + 1) % 5 == 0:
             with torch.no_grad():
-                samples = generator(fixed_noise)
+                if args.model != 'cgan':
+                    samples = generator(fixed_noise)
+                else:
+                    samples = generator(fixed_noise, fixed_labels)
             save_image((samples + 1) / 2, f'{out_dir}/epoch_{epoch+1:03d}.png', nrow=8)  # [-1, 1] -> [0, 1]
 
     # Save final weights
